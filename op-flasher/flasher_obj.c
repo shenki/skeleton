@@ -29,10 +29,10 @@
 #include <limits.h>
 #include <arpa/inet.h>
 #include <assert.h>
-#include <libflash/arch_flash.h>
-#include <libflash/libffs.h>
-#include <libflash/blocklevel.h>
-#include <libflash/errors.h>
+#include <mtd/mtd-user.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+
 #include <openbmc_intf.h>
 #include <openbmc.h>
 
@@ -48,32 +48,38 @@ static bool need_relock;
 #define FILE_BUF_SIZE	0x10000
 static uint8_t file_buf[FILE_BUF_SIZE] __aligned(0x1000);
 
-static struct blocklevel_device *bl;
-static struct ffs_handle	*ffsh;
-static uint32_t			fl_total_size, fl_erase_granule;
-static const char		*fl_name;
-static int32_t			ffs_index = -1;
-
 static uint8_t FLASH_OK = 0;
 static uint8_t FLASH_ERROR = 0x01;
 static uint8_t FLASH_SETUP_ERROR = 0x02;
 
 static int
-erase_chip(void)
+erase_chip(int fd)
 {
 	int rc = 0;
+	mtd_info_t mtd_info;
+	struct erase_info_user erase;
+
+	rc = ioctl(fd, MEMGETINFO, &mtd_info);
+	if (rc < 0) {
+		perror("could not get mtd size");
+		return errno;
+	}
+
 
 	printf("Erasing... (may take a while !) ");
 	fflush(stdout);
 
-	rc = arch_flash_erase_chip(bl);
-	if(rc) {
-		fprintf(stderr, "Error %d erasing chip\n", rc);
-		return(rc);
+	erase.start = 0;
+	erase.length = mtd_info.size;
+	rc = ioctl(fd, MEMERASE, &erase);
+	if (rc < 0) {
+		perror("Error erasing chip");
+		return errno;
 	}
 
 	printf("done !\n");
-	return(rc);
+
+	return rc;
 }
 
 void
@@ -109,29 +115,19 @@ flash_message(GDBusConnection* connection,char* obj_path,char* method, char* err
 }
 
 static int
-program_file(FlashControl* flash_control, const char *file, uint32_t start, uint32_t size)
+program_file(FlashControl* flash_control, int in_fd, int out_fd, size_t size)
 {
-	int fd, rc;
+	int infd, outfd, rc = 0;
 	ssize_t len;
 	uint32_t actual_size = 0;
-
-	fd = open(file, O_RDONLY);
-	if(fd == -1) {
-		perror("Failed to open file");
-		return(fd);
-	}
-	printf("About to program \"%s\" at 0x%08x..0x%08x !\n",
-			file, start, size);
-
-	printf("Programming & Verifying...\n");
-	//progress_init(size >> 8);
 	unsigned int save_size = size;
 	uint8_t last_progress = 0;
+
 	while(size) {
-		len = read(fd, file_buf, FILE_BUF_SIZE);
+		len = read(infd, file_buf, FILE_BUF_SIZE);
 		if(len < 0) {
-			perror("Error reading file");
-			return(1);
+			perror("mtd write failed");
+			return errno;
 		}
 		if(len == 0)
 			break;
@@ -139,119 +135,44 @@ program_file(FlashControl* flash_control, const char *file, uint32_t start, uint
 			len = size;
 		size -= len;
 		actual_size += len;
-		rc = blocklevel_write(bl, start, file_buf, len);
-		if(rc) {
-			if(rc == FLASH_ERR_VERIFY_FAILURE)
-				fprintf(stderr, "Verification failed for"
-						" chunk at 0x%08x\n", start);
-			else
-				fprintf(stderr, "Flash write error %d for"
-						" chunk at 0x%08x\n", rc, start);
-			return(rc);
+		rc = write(outfd, file_buf, len);
+		if (rc) {
+			fprintf(stderr,
+				"Flash write error %d for chunk at 0x%08lx\n",
+				rc, lseek(outfd, 0, SEEK_CUR));
+			return errno;
 		}
-		start += len;
-		unsigned int percent = (100*actual_size/save_size);
-		uint8_t progress = (uint8_t)(percent);
-		if(progress != last_progress) {
-			flash_control_emit_progress(flash_control,file,progress);
+		uint8_t progress = 100 * actual_size/save_size;
+		if (progress != last_progress) {
+			/* TODO: second arg should be the file */
+			flash_control_emit_progress(flash_control, NULL ,progress);
 			last_progress = progress;
 		}
 	}
-	close(fd);
 
-	/* If this is a flash partition, adjust its size */
-	if(ffsh && ffs_index >= 0) {
-		printf("Updating actual size in partition header...\n");
-		ffs_update_act_size(ffsh, ffs_index, actual_size);
-	}
-	return(0);
-}
-
-static void
-flash_access_cleanup_bmc(void)
-{
-	if(ffsh)
-		ffs_close(ffsh);
-	arch_flash_close(bl, NULL);
-}
-
-static int
-flash_access_setup_bmc(bool need_write)
-{
-	int rc;
-	printf("Setting up BMC flash\n");
-
-	if(arch_flash_bmc(bl, BMC_MTD) != BMC_MTD) {
-		fprintf(stderr, "Failed to init flash chip\n");
-		return FLASH_SETUP_ERROR;
-	}
-
-	/* Setup cleanup function */
-	atexit(flash_access_cleanup_bmc);
-	return FLASH_OK;
-}
-
-static void
-flash_access_cleanup_pnor(void)
-{
-	/* Re-lock flash */
-	if(need_relock)
-		arch_flash_set_wrprotect(bl, 1);
-
-	flash_access_cleanup_bmc();
-}
-
-static int
-flash_access_setup_pnor(bool need_write)
-{
-	int rc;
-	printf("Setting up BIOS flash\n");
-
-	/* Create the AST flash controller */
-
-	/* Open flash chip */
-	rc = arch_flash_init(&bl, NULL, true);
-	if(rc) {
-		fprintf(stderr, "Failed to open flash chip\n");
-		return FLASH_SETUP_ERROR;
-	}
-
-	/* Unlock flash (PNOR only) */
-	if(need_write)
-		need_relock = arch_flash_set_wrprotect(bl, 0);
-
-	/* Setup cleanup function */
-	atexit(flash_access_cleanup_pnor);
-	return FLASH_OK;
+	return rc;
 }
 
 uint8_t
-flash(FlashControl* flash_control,bool bmc_flash, uint32_t address, char* write_file, char* obj_path)
+flash(FlashControl* flash_control,const char *mtd_path, const char *write_file, char* obj_path)
 {
 	bool erase = true, program = true;
-
+	char *flash_path;
+	int file_fd, flash_fd;
 	int rc;
-	printf("flasher: %s, BMC = %d, address = 0x%x\n",write_file,bmc_flash,address);
 
-	/* Prepare for access */
-	if(bmc_flash) {
-		rc = flash_access_setup_bmc(erase || program);
-		if(rc) {
-			return FLASH_SETUP_ERROR;
-		}
-	} else {
-		rc = flash_access_setup_pnor(erase || program);
-		if(rc) {
-			return FLASH_SETUP_ERROR;
-		}
+	flash_fd = open(mtd_path, O_RDONLY);
+	if (flash_fd == -1) {
+		perror(mtd_path);
+		return errno;
 	}
 
-	rc = blocklevel_get_info(bl, &fl_name,
-			&fl_total_size, &fl_erase_granule);
-	if(rc) {
-		fprintf(stderr, "Error %d getting flash info\n", rc);
-		return FLASH_SETUP_ERROR;
+	file_fd = open(write_file, O_WRONLY);
+	if (file_fd == -1) {
+		perror(write_file);
+		return errno;
 	}
+
 	if(strcmp(write_file,"")!=0)
 	{
 		// If file specified but not size, get size from file
@@ -261,21 +182,20 @@ flash(FlashControl* flash_control,bool bmc_flash, uint32_t address, char* write_
 			return FLASH_ERROR;
 		}
 		uint32_t write_size = stbuf.st_size;
-		rc = erase_chip();
-		if(rc) {
+
+		rc = erase_chip(flash_fd);
+		if (rc) {
 			return FLASH_ERROR;
 		}
-		rc = program_file(flash_control, write_file, address, write_size);
-		if(rc) {
+
+		rc = program_file(flash_control, file_fd, flash_fd, write_size);
+		if (rc) {
 			return FLASH_ERROR;
 		}
 
 		printf("Flash done\n");
 	}
-	else
-	{
-		printf("Flash tuned\n");
-	}
+
 	return FLASH_OK;
 }
 
@@ -284,19 +204,21 @@ on_bus_acquired(GDBusConnection *connection,
 		const gchar *name,
 		gpointer user_data)
 {
+	const char *mtd_path;
 	cmdline *cmd = user_data;
-	if(cmd->argc < 4)
-	{
+	ObjectSkeleton *object;
+	gchar *s;
+
+	if (cmd->argc < 4) {
 		g_print("flasher [flash name] [filename] [source object]\n");
 		g_main_loop_quit(cmd->loop);
 		return;
 	}
 	printf("Starting flasher: %s,%s,%s,\n",cmd->argv[1],cmd->argv[2],cmd->argv[3]);
-	ObjectSkeleton *object;
-	manager = g_dbus_object_manager_server_new(dbus_object_path);
-	gchar *s;
-	s = g_strdup_printf("%s/%s",dbus_object_path,cmd->argv[1]);
 
+	manager = g_dbus_object_manager_server_new(dbus_object_path);
+
+	s = g_strdup_printf("%s/%s",dbus_object_path,cmd->argv[1]);
 	object = object_skeleton_new(s);
 	g_free(s);
 
@@ -310,21 +232,22 @@ on_bus_acquired(GDBusConnection *connection,
 
 	/* Export all objects */
 	g_dbus_object_manager_server_set_connection(manager, connection);
-	bool bmc_flash = false;
-	uint32_t address = 0;
-	if(strcmp(cmd->argv[1],"bmc")==0) {
-		bmc_flash = true;
+
+	if (strcmp(cmd->argv[1], "bmc") == 0) {
+		/* TODO: fix this */
+		mtd_path = "/dev/mtd0";
 	}
-	if(strcmp(cmd->argv[1],"bmc_ramdisk")==0) {
-		bmc_flash = true;
-		address = 0x20300000;
+	if (strcmp(cmd->argv[1], "bmc_ramdisk") == 0) {
+		mtd_path = "/dev/mtd3";
 	}
-	if(strcmp(cmd->argv[1],"bmc_kernel")==0) {
-		bmc_flash = true;
-		address = 0x20080000;
+	if (strcmp(cmd->argv[1], "bmc_kernel") == 0) {
+		mtd_path = "/dev/mtd2";
+	}
+	if (strcmp(cmd->argv[1], "pnor") == 0) {
+		mtd_path = "/dev/mtd7";
 	}
 
-	int rc = flash(flash_control,bmc_flash,address,cmd->argv[2],cmd->argv[3]);
+	int rc = flash(flash_control, mtd_path,cmd->argv[2],cmd->argv[3]);
 	if(rc) {
 		flash_message(connection,cmd->argv[3],"error","Flash Error");
 	} else {
